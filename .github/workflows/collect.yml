@@ -1,0 +1,66 @@
+name: Collect V2Ray Configs
+
+# ─────────────────────────────────────────────
+# Запуск:
+#  - по расписанию (каждые 6 часов, см. cron ниже)
+#  - вручную через вкладку Actions -> Run workflow
+# ─────────────────────────────────────────────
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # каждые 6 часов. Синтаксис: мин час день месяц день_недели
+  workflow_dispatch: {}     # ручной запуск кнопкой в интерфейсе GitHub
+
+# Нужны права на запись, чтобы бот мог закоммитить обновлённые конфиги обратно в репо
+permissions:
+  contents: write
+
+concurrency:
+  group: collect-configs
+  cancel-in-progress: true
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install --no-cache-dir requests pyyaml
+
+      - name: Run collector
+        env:
+          CI: "true"
+        run: python collector.py
+
+      - name: Show summary in job log
+        run: |
+          echo "### Config Collector — итоги" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          for f in configs/*.txt; do
+            [ -f "$f" ] || continue
+            echo "$(basename "$f"): $(wc -l < "$f") строк" >> "$GITHUB_STEP_SUMMARY"
+          done
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit and push updated configs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add configs/
+
+          # Коммитим только если реально что-то изменилось
+          if git diff --cached --quiet; then
+            echo "Изменений нет, коммит не нужен."
+          else
+            git commit -m "chore: update configs $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
