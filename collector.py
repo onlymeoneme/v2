@@ -2,6 +2,8 @@ import os
 import sys
 import time
 import base64
+import json
+import urllib.parse
 import requests
 from threading import Thread
 
@@ -23,9 +25,8 @@ BLUE    = "\033[94m"
 # ─────────────────────────────────────────────
 # Настройки
 # ─────────────────────────────────────────────
-SOURCES_FILE     = "sources.yaml"
-OUTPUT_DIR       = "configs"
-COMBINED_FILE    = os.path.join(OUTPUT_DIR, "all_configs.txt")
+SOURCES_FILE    = "sources.yaml"
+OUTPUT_DIR      = "configs"
 REQUEST_TIMEOUT  = 12  # секунды
 
 HEADERS = {
@@ -33,7 +34,6 @@ HEADERS = {
 }
 
 # Префикс протокола -> имя выходного файла.
-# Несколько префиксов могут указывать на один и тот же файл (алиасы).
 PROTOCOL_PREFIXES = [
     ("vmess://", "vmess"),
     ("vless://", "vless"),
@@ -128,12 +128,48 @@ def get_protocol(line: str) -> str | None:
     return None
 
 
+def is_websocket(line: str) -> bool:
+    """Возвращает True, если конфигурация прокси использует транспорт WebSocket (ws)."""
+    lowered = line.lower()
+    
+    # 1. Специфичная проверка для VMess (данные зашиты в Base64 JSON)
+    if lowered.startswith("vmess://"):
+        try:
+            b64_content = line[8:].split('#', 1)[0].strip()
+            padding = len(b64_content) % 4
+            if padding:
+                b64_content += "=" * (4 - padding)
+            decoded = base64.b64decode(b64_content).decode("utf-8", errors="ignore")
+            data = json.loads(decoded)
+            if data.get("net") == "ws" or data.get("type") == "ws":
+                return True
+        except Exception:
+            pass
+    # 2. Проверка для VLESS, Trojan, ShadowSocks (обычно передаются через параметры URL)
+    else:
+        try:
+            parsed = urllib.parse.urlparse(line)
+            query = urllib.parse.parse_qs(parsed.query.lower())
+            if 'type' in query and 'ws' in query['type']:
+                return True
+            if 'net' in query and 'ws' in query['net']:
+                return True
+            if 'transport' in query and 'ws' in query['transport']:
+                return True
+        except Exception:
+            pass
+        
+        # Запасной текстовый поиск по сигнатурам, если URL не распарсился стандартным методом
+        if "type=ws" in lowered or "net=ws" in lowered or "transport=ws" in lowered:
+            return True
+            
+    return False
+
+
 def extract_valid_lines(text: str) -> list[tuple[str, str]]:
     """
-    Разбирает текст на строки и оставляет только те, что относятся
-    к поддерживаемым протоколам. Возвращает список (протокол, строка).
-    Это и есть фильтрация по протоколам — отсекает HTML-мусор, комментарии,
-    случайные http(s):// ссылки и т.п.
+    Разбирает текст на строки, фильтрует по протоколам и отсекает WebSocket серверы.
+    Возвращает список кортежей (протокол, строка).
     """
     result = []
     for raw_line in text.splitlines():
@@ -142,6 +178,9 @@ def extract_valid_lines(text: str) -> list[tuple[str, str]]:
             continue
         protocol = get_protocol(line)
         if protocol:
+            # Если это WebSocket-сервер — пропускаем его (удаляем из итогового списка)
+            if is_websocket(line):
+                continue
             result.append((protocol, line))
     return result
 
@@ -155,12 +194,10 @@ def decode_content(raw: str) -> tuple[list[tuple[str, str]], str]:
     if not content:
         return [], "Empty"
 
-    # Если в тексте есть хотя бы один протокол-префикс — это Plain-текст
     if "://" in content:
         lines = extract_valid_lines(content)
         return lines, "Plain"
 
-    # Иначе пробуем Base64
     try:
         padding = len(content) % 4
         if padding:
@@ -220,15 +257,12 @@ def parse_configs(url: str) -> tuple[list[tuple[str, str]], str]:
 
 
 def dedup_key(line: str) -> str:
-    """
-    Ключ для дедупликации: та же нода может встречаться в разных списках
-    с разным #remark (именем) в конце — убираем его перед сравнением.
-    """
+    """Ключ для дедупликации (игнорирует имя сервера после знака #)."""
     return line.split("#", 1)[0].strip()
 
 
 def write_atomic(path: str, content: str) -> bool:
-    """Записывает файл атомарно (через .tmp + os.replace), чтобы не оставить битый файл при сбое."""
+    """Записывает файл атомарно через .tmp, исключая повреждение файлов при сбое."""
     tmp_path = path + ".tmp"
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -242,31 +276,87 @@ def write_atomic(path: str, content: str) -> bool:
         return False
 
 
+def split_into_chunks(lines: list[str], max_size: int = 1024 * 1024) -> list[str]:
+    """Разбивает список строк на текстовые чанки, каждый из которых весит не более max_size байт."""
+    chunks = []
+    current_chunk = []
+    current_size = 0
+    
+    for line in lines:
+        # Длина строки в байтах + 1 байт на символ новой строки '\n'
+        line_bytes_len = len(line.encode('utf-8')) + 1
+        
+        if current_size + line_bytes_len > max_size and current_chunk:
+            chunks.append("\n".join(current_chunk) + "\n")
+            current_chunk = [line]
+            current_size = line_bytes_len
+        else:
+            current_chunk.append(line)
+            current_size += line_bytes_len
+            
+    if current_chunk:
+        chunks.append("\n".join(current_chunk) + "\n")
+        
+    return chunks
+
+
 def write_output_files(protocol_configs: dict[str, list[str]], total_unique: int) -> None:
-    """
-    Сохраняет результаты по протоколам + общий файл.
-    Если за весь прогон не найдено ни одного конфига (полный провал —
-    например, все источники недоступны), НИЧЕГО не перезаписывается,
-    старые файлы остаются как есть.
-    Если конкретный протокол в этом прогоне не дал результатов, но давал
-    в прошлый раз — его файл тоже не трогаем (не считаем это провалом).
-    """
+    """Сохраняет результаты по протоколам и общий файл с разделением по чанкам до 1 МБ."""
     if total_unique == 0:
         print(f"{RED}⚠ Не найдено ни одного конфига за весь прогон.{RESET}")
         print(f"{RED}  Файлы НЕ изменены, чтобы не потерять предыдущий результат.{RESET}")
         return
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    MAX_FILE_SIZE = 1024 * 1024  # 1 Мегабайт
 
     all_configs: list[str] = []
+    
+    # 1. Запись файлов по отдельным протоколам
     for protocol, configs in protocol_configs.items():
         all_configs.extend(configs)
         if not configs:
-            continue  # нет данных по этому протоколу в этом прогоне — не трогаем старый файл
-        path = os.path.join(OUTPUT_DIR, f"{protocol}.txt")
-        write_atomic(path, "\n".join(configs) + "\n")
+            continue  # Нет данных по этому протоколу в текущем прогоне — старые файлы не трогаем
+        
+        chunks = split_into_chunks(configs, MAX_FILE_SIZE)
+        
+        # Сохраняем новые файлы (например, vless_1.txt, vless_2.txt)
+        for idx, chunk_content in enumerate(chunks, start=1):
+            path = os.path.join(OUTPUT_DIR, f"{protocol}_{idx}.txt")
+            write_atomic(path, chunk_content)
+            
+        # Удаляем старые лишние файлы, если в прошлый раз чанков было больше, чем сейчас
+        idx = len(chunks) + 1
+        while True:
+            old_path = os.path.join(OUTPUT_DIR, f"{protocol}_{idx}.txt")
+            if os.path.exists(old_path):
+                try:
+                    os.remove(old_path)
+                except OSError:
+                    pass
+                idx += 1
+            else:
+                break
 
-    write_atomic(COMBINED_FILE, "\n".join(all_configs) + "\n")
+    # 2. Запись общего комбинированного файла (all_configs_1.txt, all_configs_2.txt и т.д.)
+    if all_configs:
+        combined_chunks = split_into_chunks(all_configs, MAX_FILE_SIZE)
+        for idx, chunk_content in enumerate(combined_chunks, start=1):
+            path = os.path.join(OUTPUT_DIR, f"all_configs_{idx}.txt")
+            write_atomic(path, chunk_content)
+            
+        # Очистка старых лишних общих файлов
+        idx = len(combined_chunks) + 1
+        while True:
+            old_path = os.path.join(OUTPUT_DIR, f"all_configs_{idx}.txt")
+            if os.path.exists(old_path):
+                try:
+                    os.remove(old_path)
+                except OSError:
+                    pass
+                idx += 1
+            else:
+                break
 
 
 # ─────────────────────────────────────────────
@@ -284,7 +374,6 @@ def main():
     else:
         print("=== Config Collector starting ===")
 
-    # dict[протокол][ключ_дедупа] = полная_строка  (сохраняет порядок первого появления)
     seen_by_protocol: dict[str, dict[str, str]] = {name: {} for _, name in PROTOCOL_PREFIXES}
 
     total_raw = 0
@@ -315,7 +404,7 @@ def main():
                 print(f"[{data_type}] {len(configs):>4} configs  {shorten_url(link)}")
 
     except KeyboardInterrupt:
-        print(f"\n{YELLOW}⚠  Прервано пользователем (Ctrl+C){RESET}")
+        print(f"\n{YELLOW}⚠ Прервано пользователем (Ctrl+C){RESET}")
 
     finally:
         protocol_configs = {name: list(d.values()) for name, d in seen_by_protocol.items()}
